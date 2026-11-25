@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodically update Svyaz from GitHub Releases
+
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=10min
+Unit=svyaz-update.service
+
+[Install]
+WantedBy=timers.target

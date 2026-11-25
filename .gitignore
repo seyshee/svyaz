@@ -2,3 +2,9 @@ data/
 backup-*/
 deploy.py
 dlya-lehi.txt
+
+/svyaz-data/
+/.aws/
+/.codex/
+/.agents/
+/svyaz

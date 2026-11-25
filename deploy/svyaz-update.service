@@ -1,0 +1,13 @@
+[Unit]
+Description=Check GitHub Releases for Svyaz
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/lib/svyaz/update-release.py
+StateDirectory=svyaz-updater
+StateDirectoryMode=0700
+PrivateTmp=yes
+ProtectHome=yes
+NoNewPrivileges=yes

@@ -94,7 +94,7 @@ func (s *server) taskAPI(w http.ResponseWriter, r *http.Request, t int, me strin
 		changes = append(changes, taskText(v, 500))
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
-	entry := obj{"ts": now, "by": aiLabel(me), "what": strings.Join(changes, "; ")}
+	entry := obj{"ts": now, "by": me, "what": strings.Join(changes, "; ")}
 	if id := number(arg("msg")); id > 0 {
 		entry["msg"] = id
 	}

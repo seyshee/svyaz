@@ -77,7 +77,7 @@ func openServer(dir string) *server {
 	db, err := sql.Open("sqlite3", filepath.Join(dir, "chat.sqlite")+"?_txlock=immediate&_journal_mode=WAL&_busy_timeout=5000")
 	checked(err)
 	db.SetMaxOpenConns(4)
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS users(name TEXT PRIMARY KEY,h TEXT UNIQUE, ai TEXT UNIQUE, admin BOOLEAN);
+	_, err = db.Exec(liveSchema + contentSchema + `CREATE TABLE IF NOT EXISTS users(name TEXT PRIMARY KEY,h TEXT UNIQUE, ai TEXT UNIQUE, admin BOOLEAN);
  CREATE TABLE IF NOT EXISTS removed(t INTEGER,name TEXT,by_name TEXT,reason TEXT,ts TEXT,PRIMARY KEY(t,name)); CREATE TABLE IF NOT EXISTS retired(name TEXT PRIMARY KEY); CREATE TABLE IF NOT EXISTS tasks(t INTEGER,n INTEGER,body TEXT,PRIMARY KEY(t,n)); DROP INDEX IF EXISTS founder; CREATE TABLE IF NOT EXISTS legacy_ai(hash TEXT PRIMARY KEY,name TEXT); CREATE TABLE IF NOT EXISTS topic_metadata(t INTEGER PRIMARY KEY,body TEXT);
  CREATE TABLE IF NOT EXISTS topics(id INTEGER PRIMARY KEY,title TEXT,creator TEXT,members TEXT,created TEXT);
  CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY,t INTEGER,body TEXT);
@@ -94,7 +94,7 @@ func (s *server) api(w http.ResponseWriter, r *http.Request) {
 			fail(w, 500, "ошибка сервера")
 		}
 	}()
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<20)
 	if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/") {
 		if err := r.ParseMultipartForm(1 << 20); err != nil {
 			fail(w, 400, "ошибка формы")
@@ -106,7 +106,7 @@ func (s *server) api(w http.ResponseWriter, r *http.Request) {
 	}
 	arg := r.FormValue
 	a := arg("a")
-	writeAccess := a == "forget" || a == "kick" || a == "add"
+	writeAccess := a == "aikey" || a == "forget" || a == "kick" || a == "add"
 	if writeAccess {
 		s.access.Lock()
 		defer s.access.Unlock()
@@ -115,10 +115,19 @@ func (s *server) api(w http.ResponseWriter, r *http.Request) {
 		defer s.access.RUnlock()
 	}
 	key := r.Header.Get("X-Key")
+	if key == "" && a == "file" {
+		if c, e := r.Cookie("svyaz_media"); e == nil {
+			key = c.Value
+		}
+	}
 	ai := strings.HasPrefix(key, "ai-")
+	sub := ""
 	var me string
 	var admin bool
 	err := s.db.QueryRow("SELECT name,admin FROM users WHERE h=? OR ai=? OR name=(SELECT name FROM legacy_ai WHERE hash=?)", digest(key), digest(key), digest(key)).Scan(&me, &admin)
+	if errors.Is(err, sql.ErrNoRows) && ai {
+		err = s.db.QueryRow("SELECT agents.name,sub FROM agents JOIN users ON users.name=agents.name WHERE hash=?", digest(key)).Scan(&me, &sub)
+	}
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		panic(err)
 	}
@@ -127,6 +136,10 @@ func (s *server) api(w http.ResponseWriter, r *http.Request) {
 		checked(s.db.QueryRow("SELECT NOT EXISTS(SELECT 1 FROM users)").Scan(&empty))
 		respond(w, 401, obj{"error": "нужен ключ", "setup": empty})
 		return
+	}
+	agentLabel := aiLabel(me)
+	if sub != "" {
+		agentLabel += " · " + sub
 	}
 	admin = admin && !ai
 	ok := func(v any) { respond(w, 200, v) }
@@ -161,11 +174,42 @@ func (s *server) api(w http.ResponseWriter, r *http.Request) {
 		ok(obj{"key": k, "name": n})
 		return
 	case "me":
-		ok(obj{"name": me, "admin": admin, "is_ai": ai, "subs": []string{}})
+		if !ai {
+			http.SetCookie(w, &http.Cookie{Name: "svyaz_media", Value: key, Path: "/api.php", HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode})
+		}
+		ok(obj{"name": me, "ai": agentLabel, "admin": admin, "is_ai": ai, "subs": s.strings("SELECT sub FROM agents WHERE name=? ORDER BY sub", me), "admins": s.strings("SELECT name FROM users WHERE admin AND ? ORDER BY name", admin)})
 		return
 	case "aikey":
-		if ai || arg("sub") != "" {
+		if ai {
 			fail(w, 403, "доступен основной ИИ человека")
+			return
+		}
+		if sig := strings.TrimSpace(arg("sub")); sig != "" {
+			if utf8.RuneCountInString(sig) > 20 || strings.ContainsAny(sig, ",@<>·") {
+				fail(w, 400, "недопустимая подпись")
+				return
+			}
+			if arg("off") == "1" {
+				_, e := s.db.Exec("DELETE FROM agents WHERE name=? AND sub=?", me, sig)
+				checked(e)
+				s.wakeAll()
+				ok(obj{"ok": true})
+				return
+			}
+			salt := token("")
+			var existing sql.NullString
+			e := s.db.QueryRow("SELECT salt FROM agents WHERE name=? AND sub=?", me, sig).Scan(&existing)
+			if e != nil && e != sql.ErrNoRows {
+				checked(e)
+			}
+			if existing.Valid {
+				salt = existing.String
+			}
+			k := "ai-" + digest("svyaz/sub/"+key+"/"+sig+"/"+salt)
+			_, e = s.db.Exec("INSERT INTO agents VALUES(?,?,?,?) ON CONFLICT(name,sub) DO UPDATE SET hash=excluded.hash,salt=excluded.salt", me, sig, digest(k), salt)
+			checked(e)
+			s.wakeAll()
+			ok(obj{"key": k, "ai": aiLabel(me) + " · " + sig})
 			return
 		}
 		k := "ai-" + digest("svyaz/ai/"+key)
@@ -221,7 +265,13 @@ func (s *server) api(w http.ResponseWriter, r *http.Request) {
 		ok(s.removals(me, 0))
 		return
 	case "holiday":
-		ok(obj{})
+		day := today()
+		next := day.AddDate(0, 0, 1)
+		tomorrow := holiday(next)
+		if tomorrow["from"] != next.Format(time.DateOnly) {
+			tomorrow = nil
+		}
+		ok(obj{"today": holiday(day), "tomorrow": tomorrow})
 		return
 	}
 	t := number(arg("t"))
@@ -245,6 +295,11 @@ func (s *server) api(w http.ResponseWriter, r *http.Request) {
 	checked(rows.Err())
 	rows.Close()
 	if a == "topics" {
+		for _, topic := range topics {
+			id := topic["id"].(int)
+			topic["ais"] = s.topicAgents(id)
+			topic["calls"] = s.calls(id, me)
+		}
 		ok(topics)
 		return
 	}
@@ -260,22 +315,59 @@ func (s *server) api(w http.ResponseWriter, r *http.Request) {
 	case "add", "kick":
 		s.membership(w, r, t, me, ai, admin, topics[0])
 		return
+	case "edit", "del":
+		s.editMessage(w, r, t, me, sub, ai)
+	case "rename", "archive":
+		s.topicChange(w, r, t, me)
+	case "usage":
+		if !ai {
+			fail(w, 403, "расход шлёт ИИ")
+			return
+		}
+		s.reportUsage(w, t, agentLabel, arg("u"))
+	case "typing":
+		if ai {
+			fail(w, 403, "печатает человек")
+			return
+		}
+		s.activity(t, me, "typing", 0)
+		ok(obj{"ok": true})
+	case "file":
+		s.file(w, r, t, me)
 	case "post":
 		text := strings.TrimSpace(arg("text"))
-		if text == "" || utf8.RuneCountInString(text) > 20000 || r.MultipartForm != nil && len(r.MultipartForm.File) > 0 {
+		if (text == "" && arg("card") != "1" && (r.MultipartForm == nil || len(r.MultipartForm.File) == 0)) || utf8.RuneCountInString(text) > 20000 {
 			fail(w, 400, "доступен текст до 20000 символов")
 			return
 		}
 		from := me
 		if ai {
-			from = aiLabel(me)
+			from = agentLabel
 		}
 		m := obj{"who": me, "from": from, "ai": ai, "text": text, "ts": time.Now().UTC().Format(time.RFC3339), "priv": arg("priv") == "1"}
+		if sub != "" {
+			m["sub"] = sub
+		}
 		if arg("ask") == "1" {
 			m["ask"] = true
 		}
-		if to := arg("to"); to != "" && arg("priv") != "1" {
-			m["to"] = strings.Split(to, ",")
+		if arg("card") == "1" {
+			h := holiday(today())
+			if h == nil {
+				fail(w, 400, "сегодня нет праздника")
+				return
+			}
+			m["card"] = obj{"name": h["name"], "hue": h["hue"]}
+		}
+		if arg("priv") != "1" {
+			to, e := s.recipients(topics[0]["members"].(json.RawMessage), text, arg("to"))
+			if e != nil {
+				fail(w, 400, e.Error())
+				return
+			}
+			if len(to) > 0 {
+				m["to"] = to
+			}
 		}
 		if reply := number(arg("reply")); reply > 0 {
 			m["reply"] = reply
@@ -283,9 +375,9 @@ func (s *server) api(w http.ResponseWriter, r *http.Request) {
 				m["quote"] = quote
 			}
 		}
-		ok(obj{"id": s.appendMessage(t, m)})
+		s.savePost(w, r, t, m)
 	case "tasks", "task":
-		s.taskAPI(w, r, t, me, ai)
+		s.taskAPI(w, r, t, agentLabel, ai)
 	case "react":
 		meaning, exists := reactionMeanings[arg("r")]
 		if !exists {
@@ -293,9 +385,9 @@ func (s *server) api(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		on := number(arg("on"))
-		var owner string
+		var owner, targetSub string
 		var private, targetAI bool
-		err := s.db.QueryRow(`SELECT json_extract(body,'$.who'),coalesce(json_extract(body,'$.priv'),0),coalesce(json_extract(body,'$.ai'),0) FROM messages WHERE t=? AND coalesce(json_extract(body,'$.id'),id)=? AND coalesce(json_extract(body,'$.gone'),0)=0 AND json_extract(body,'$.react') IS NULL AND json_extract(body,'$.edit') IS NULL AND json_extract(body,'$.del') IS NULL`, t, on).Scan(&owner, &private, &targetAI)
+		err := s.db.QueryRow(`SELECT json_extract(body,'$.who'),coalesce(json_extract(body,'$.priv'),0),coalesce(json_extract(body,'$.ai'),0),coalesce(json_extract(body,'$.sub'),'') FROM messages WHERE t=? AND coalesce(json_extract(body,'$.id'),id)=? AND coalesce(json_extract(body,'$.gone'),0)=0 AND json_extract(body,'$.react') IS NULL AND json_extract(body,'$.edit') IS NULL AND json_extract(body,'$.del') IS NULL`, t, on).Scan(&owner, &private, &targetAI, &targetSub)
 		if errors.Is(err, sql.ErrNoRows) || private && owner != me {
 			fail(w, 404, "нет сообщения")
 			return
@@ -305,12 +397,16 @@ func (s *server) api(w http.ResponseWriter, r *http.Request) {
 		if off {
 			meaning += " (снято)"
 		}
-		m := obj{"who": me, "ai": ai, "on": on, "off": off, "priv": private, "react": arg("r"), "meaning": meaning, "ts": time.Now().UTC().Format(time.RFC3339)}
+		m := obj{"who": me, "ai": ai, "sub": sub, "on": on, "off": off, "priv": private, "react": arg("r"), "meaning": meaning, "ts": time.Now().UTC().Format(time.RFC3339)}
 		if targetAI {
 			m["notify_ai"] = owner
+			m["notify_sub"] = targetSub
 		}
 		ok(obj{"id": s.appendMessage(t, m)})
 	case "read", "wait":
+		if a == "wait" && ai && sub == "" {
+			s.activity(t, me, "wait", 0)
+		}
 		seconds := number(arg("wait"))
 		if a == "wait" && arg("wait") == "" {
 			seconds = 25
@@ -325,6 +421,14 @@ func (s *server) api(w http.ResponseWriter, r *http.Request) {
 				s.changed[t] = ch
 			}
 			s.mu.Unlock()
+			if sub != "" {
+				var valid bool
+				checked(s.db.QueryRow("SELECT EXISTS(SELECT 1 FROM agents WHERE hash=?)", digest(key)).Scan(&valid))
+				if !valid {
+					fail(w, 401, "ключ отозван")
+					return
+				}
+			}
 			var allowed bool
 			checked(s.db.QueryRow("SELECT EXISTS(SELECT 1 FROM topics,json_each(members) WHERE topics.id=? AND value=?)", t, me).Scan(&allowed))
 			if !allowed {
@@ -344,17 +448,31 @@ func (s *server) api(w http.ResponseWriter, r *http.Request) {
 				m["id"] = id
 				messages = append(messages, m)
 				if m["react"] != nil {
-					hit = hit || (m["notify_ai"] == me && !(m["ai"] == true && m["who"] == me))
-				} else if m["sys"] != true && m["del"] == nil && (m["ai"] != true || m["who"] != me) {
-					if tos, yes := m["to"].([]any); !yes || slices.Contains(tos, any(aiLabel(me))) {
+					hit = hit || (m["notify_ai"] == me && stringField(m, "notify_sub") == sub && !(m["ai"] == true && m["who"] == me && stringField(m, "sub") == sub))
+				} else if m["sys"] != true && m["del"] == nil && (m["ai"] != true || m["who"] != me || stringField(m, "sub") != sub) {
+					if tos, yes := m["to"].([]any); !yes || slices.Contains(tos, any(agentLabel)) {
 						hit = true
 					}
 				}
 			}
 			checked(rows.Err())
 			rows.Close()
-			result := obj{"messages": messages, "skip": skip, "j": j, "topic": topics[0], "me": me, "my_ai": aiLabel(me)}
-			if (a == "wait" && hit) || (a == "read" && len(messages) > 0) {
+			result := obj{"messages": messages, "skip": skip, "j": j, "topic": topics[0], "me": me, "my_ai": agentLabel, "holiday": holiday(today())}
+			if a == "read" {
+				for k, v := range s.live(t, me) {
+					result[k] = v
+				}
+			}
+			if a == "wait" && hit && ai && sub == "" {
+				on := 0
+				for _, m := range messages {
+					if m["react"] == nil && m["edit"] == nil && m["del"] == nil && m["sys"] != true && m["priv"] != true && !(m["ai"] == true && m["who"] == me && stringField(m, "sub") == "") {
+						on = m["id"].(int)
+					}
+				}
+				s.activity(t, me, "hit", on)
+			}
+			if (a == "wait" && hit) || (a == "read" && (len(messages) > 0 || arg("lv") != "" && arg("lv") != result["lv"])) {
 				ok(result)
 				return
 			}
@@ -371,6 +489,9 @@ func (s *server) api(w http.ResponseWriter, r *http.Request) {
 				if a == "wait" {
 					w.WriteHeader(204)
 				} else {
+					for k, v := range s.live(t, me) {
+						result[k] = v
+					}
 					ok(result)
 				}
 				return
@@ -424,13 +545,17 @@ var reactionMeanings = map[string]string{
 
 func (s *server) appendMessage(t int, m obj) int {
 	id := insertMessage(s.db, t, m)
+	s.signal(t)
+	return id
+}
+func (s *server) signal(t int) {
 	s.mu.Lock()
 	if ch := s.changed[t]; ch != nil {
 		close(ch)
 		delete(s.changed, t)
 	}
 	s.mu.Unlock()
-	return id
+
 }
 
 func insertMessage(db messageDB, t int, m obj) int {
@@ -440,4 +565,19 @@ func insertMessage(db messageDB, t int, m obj) int {
 	err = db.QueryRow(`INSERT INTO messages(t,body) SELECT ?,json_set(?, '$.id',1+coalesce(max(coalesce(json_extract(body,'$.id'),id)),0)) FROM messages WHERE t=? RETURNING json_extract(body,'$.id')`, t, string(raw), t).Scan(&id)
 	checked(err)
 	return id
+}
+
+func stringField(m obj, k string) string { v, _ := m[k].(string); return v }
+func (s *server) strings(q string, args ...any) []string {
+	rows, e := s.db.Query(q, args...)
+	checked(e)
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var v string
+		checked(rows.Scan(&v))
+		out = append(out, v)
+	}
+	checked(rows.Err())
+	return out
 }

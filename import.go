@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 )
@@ -37,6 +38,14 @@ func optionalPHP(dir, name string, dst any) error {
 }
 
 func (s *server) importPHP(dir string) error {
+	var signatures map[string][]string
+	if err := legacyMap(dir, "ais", &signatures); err != nil {
+		return err
+	}
+	var reports map[string]map[string]obj
+	if err := legacyMap(dir, "use", &reports); err != nil {
+		return err
+	}
 	var keys map[string]string
 	var admins []string
 	var secret string
@@ -79,6 +88,16 @@ func (s *server) importPHP(dir string) error {
 		if secret != "" {
 			mac := hmac.New(sha256.New, []byte(secret))
 			mac.Write([]byte(hash))
+			for _, sub := range signatures[name] {
+				mac.Reset()
+				mac.Write([]byte(hash + "|" + sub))
+				old := "ai-" + hex.EncodeToString(mac.Sum(nil))
+				if _, err = tx.Exec("INSERT INTO agents VALUES(?,?,?,NULL)", name, sub, digest(old)); err != nil {
+					return err
+				}
+			}
+			mac.Reset()
+			mac.Write([]byte(hash))
 			ai := "ai-" + hex.EncodeToString(mac.Sum(nil))
 			if _, err = tx.Exec("INSERT INTO legacy_ai VALUES(?,?)", digest(ai), name); err != nil {
 				return err
@@ -90,6 +109,7 @@ func (s *server) importPHP(dir string) error {
 			ID                 int
 			Title, By, Created string
 			Members            []string
+			Gone               map[string]struct{ By, Why, Ts string }
 		}
 		if err = json.Unmarshal(raw, &t); err != nil {
 			return err
@@ -107,14 +127,39 @@ func (s *server) importPHP(dir string) error {
 		}
 		for _, body := range messages {
 			var m struct {
-				ID  int
-				Who string
+				ID    int
+				Who   string
+				Files []struct{ F string }
 			}
 			if err = json.Unmarshal(body, &m); err != nil {
 				return err
 			}
 			if m.ID <= 0 {
 				return fmt.Errorf("тема %d: некорректный номер сообщения", t.ID)
+			}
+			for _, file := range m.Files {
+				if !legacyFilename.MatchString(file.F) {
+					return errors.New("некорректное имя вложения")
+				}
+				path := filepath.Join(dir, "f", file.F)
+				info, e := os.Lstat(path)
+				if e != nil {
+					return e
+				}
+				if !info.Mode().IsRegular() || info.Size() > 64<<20 {
+					return errors.New("некорректный файл вложения")
+				}
+				data, e := os.ReadFile(path)
+				if e != nil {
+					return e
+				}
+				mime := mediaType(filepath.Ext(path), data)
+				if mime == "" {
+					return fmt.Errorf("неподдерживаемое вложение темы %d", t.ID)
+				}
+				if _, e = tx.Exec("INSERT INTO attachments VALUES(?,?,?,?,?)", file.F, t.ID, m.ID, mime, data); e != nil {
+					return e
+				}
 			}
 			if legacyMembers && m.Who != "" && !slices.Contains(t.Members, m.Who) {
 				t.Members = append(t.Members, m.Who)
@@ -143,9 +188,40 @@ func (s *server) importPHP(dir string) error {
 		if _, err = tx.Exec("INSERT INTO topics VALUES(?,?,?,?,?)", t.ID, t.Title, t.By, string(members), t.Created); err != nil {
 			return err
 		}
+		for name, entry := range t.Gone {
+			if slices.Contains(t.Members, name) {
+				continue
+			}
+			if _, err = tx.Exec("INSERT INTO removed VALUES(?,?,?,?,?)", t.ID, name, entry.By, entry.Why, entry.Ts); err != nil {
+				return err
+			}
+		}
+		for n, report := range reports[fmt.Sprintf("t%d", t.ID)] {
+			report["n"] = n
+			data, e := json.Marshal(report)
+			if e != nil {
+				return e
+			}
+			if _, e = tx.Exec("INSERT INTO usage VALUES(?,?,?)", t.ID, n, string(data)); e != nil {
+				return e
+			}
+		}
 		if _, err = tx.Exec("INSERT INTO topic_metadata VALUES(?,?)", t.ID, string(raw)); err != nil {
 			return err
 		}
 	}
 	return tx.Commit()
+}
+
+var legacyFilename = regexp.MustCompile(`^[0-9a-f]{32}\.[a-z0-9]{2,5}$`)
+
+func legacyMap(dir, name string, dst any) error {
+	var raw json.RawMessage
+	if err := optionalPHP(dir, name, &raw); err != nil {
+		return err
+	}
+	if len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("[]")) {
+		return nil
+	}
+	return json.Unmarshal(raw, dst)
 }

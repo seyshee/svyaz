@@ -1,11 +1,13 @@
 name: Release Go server
 on:
+  workflow_dispatch:
   push:
     tags: ['v*.*.*']
 permissions:
   contents: read
 jobs:
   build:
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
